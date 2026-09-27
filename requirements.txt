@@ -1,0 +1,15 @@
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+numba==0.67.0
+scikit-learn==1.9.1
+xgboost==3.4.1
+rapidfuzz==3.14.6
+anyascii==0.3.3
+tqdm==4.70.1
+torch==2.14.0
+transformers==5.17.0
+sentencepiece==0.2.2
+accelerate==1.15.0
+huggingface_hub==1.33.0
+pytest==9.1.1
