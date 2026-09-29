@@ -47,7 +47,7 @@ RAM is proportional anonymous memory of the stage's whole process tree.
 | 04 blocking | 6.2 GB | - | 11 min |
 | 05 features (4 workers) | 6.3 GB | - | 16 min |
 | 06 GBDT | 6.0 GB | ~2.5 GB | 7 min |
-| 07 cross-encoder fit / score | 3.8 / 5.9 GB | 4.0 GB | ~100 min fit (1.5M pairs), ~25 min score |
+| 07 cross-encoder fit / score | 3.8 / 5.9 GB | 4.0 GB | ~90 min fit (1.5M pairs), ~2h15m score (~12M pairs) |
 | 08 LLM judge | 5.2 GB | 4.0 GB | ~3.2 h at the default `--llm-max-pairs 50000` |
 
 What keeps it inside 16GB (see each script's docstring for details): one
