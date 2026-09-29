@@ -63,7 +63,7 @@ from er.config import add_common_args, paths_from_args
 from er.io import load_countries, load_pool, load_s1, load_s1_splits, mark_stage_done, pair_key, stage_is_done
 
 # Bumped whenever the output format changes, so a stale _DONE isn't reused.
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = 3  # bumped: candidates now carry the real per-candidate RRF score
 TEXT_COLS = ["entity_id_num", "name_clean", "address_clean", "addr_numbers", "name_nospace"]
 K_MAX = max(CNP_K_GRID)
 
@@ -121,6 +121,12 @@ def block_country(
     out = {
         v: {
             "ids": np.full((n_s1, k), -1, dtype=np.int32),
+            # RRF-fused score for each of "ids"'s candidates, same shape/order --
+            # carried through to candidate_pairs so 05_features can compare a
+            # candidate's own blocking score against the reverse-agg best/second
+            # below on the same scale (both RRF), instead of recomputing an
+            # unrelated 0-1 name/address-cosine proxy at feature time.
+            "scores": np.full((n_s1, k), -np.inf, dtype=np.float32),
             "best": np.zeros(n_pool, dtype=np.float32),
             "second": np.zeros(n_pool, dtype=np.float32),
             "count": np.zeros(n_pool, dtype=np.int32),
@@ -140,7 +146,9 @@ def block_country(
                 continue
             o = out[v]
             accumulate_column_top2(fused, o["best"], o["second"], o["count"])
-            o["ids"][start:end] = topk_per_row(fused, k)[0]
+            ids_chunk, scores_chunk = topk_per_row(fused, k)
+            o["ids"][start:end] = ids_chunk
+            o["scores"][start:end] = scores_chunk
         del fused_base, fused_dense
     print(f"    {n_s1} S1 rows scored in {time.time() - t0:.0f}s", flush=True)
 
@@ -186,7 +194,7 @@ def reverse_agg_frame(pool_src: np.ndarray, pool_id: np.ndarray, agg: dict[str, 
     })
 
 
-def long_candidates(s1_ids: np.ndarray, ids_k: np.ndarray, pool_src: np.ndarray, pool_id: np.ndarray) -> pd.DataFrame:
+def long_candidates(s1_ids: np.ndarray, ids_k: np.ndarray, scores_k: np.ndarray, pool_src: np.ndarray, pool_id: np.ndarray) -> pd.DataFrame:
     """One row per (S1, candidate). Ids are stored as int32 (all < 1e9)."""
     rows, ranks = np.nonzero(ids_k >= 0)
     cols = ids_k[rows, ranks]
@@ -195,11 +203,12 @@ def long_candidates(s1_ids: np.ndarray, ids_k: np.ndarray, pool_src: np.ndarray,
         "match_source": pool_src[cols].astype(np.int8),
         "match_id_num": pool_id[cols].astype(np.int32),
         "rank": (ranks + 1).astype(np.int16),
+        "score": scores_k[rows, ranks].astype(np.float32),
     })
 
 
 def write_test_candidates(tsv, writer_holder: dict, long_path: Path,
-                          s1_ids: np.ndarray, ids_k: np.ndarray, pool_src: np.ndarray, pool_id: np.ndarray,
+                          s1_ids: np.ndarray, ids_k: np.ndarray, scores_k: np.ndarray, pool_src: np.ndarray, pool_id: np.ndarray,
                           chunk: int = 50_000) -> None:
     """Append one country's candidates to candidate_pairs.tsv and the long
     parquet, `chunk` S1 rows at a time (a whole country at once is ~40M long
@@ -212,7 +221,9 @@ def write_test_candidates(tsv, writer_holder: dict, long_path: Path,
             cands = ",".join(f"S{src_l[j]}-{id_l[j]}" for j in row if j >= 0)
             lines.append(f"S1-{s1}\t{cands}\n")
         tsv.write("".join(lines))
-        table = pa.Table.from_pandas(long_candidates(s1_ids[start:end], block, pool_src, pool_id), preserve_index=False)
+        table = pa.Table.from_pandas(
+            long_candidates(s1_ids[start:end], block, scores_k[start:end], pool_src, pool_id), preserve_index=False,
+        )
         if writer_holder.get("w") is None:
             writer_holder["w"] = pq.ParquetWriter(long_path, table.schema)
         writer_holder["w"].write_table(table)
@@ -290,6 +301,7 @@ def main() -> int:
     for country, c in per_country.items():
         res = c["res"][variant]
         ids_k = res["ids"][:, :chosen_k]
+        scores_k = res["scores"][:, :chosen_k]
         hits = int((c["pos"][variant] < chosen_k).sum())
         total = len(c["t_s1"])
         n_cand = int((ids_k >= 0).sum())
@@ -302,7 +314,7 @@ def main() -> int:
         }
         train_reverse.append(reverse_agg_frame(c["pool_src"], c["pool_id"], res))
         keep = np.isin(c["split"], ["T", "Vcal", "Vtest"])
-        cand = long_candidates(c["s1_ids"][keep], ids_k[keep], c["pool_src"], c["pool_id"])
+        cand = long_candidates(c["s1_ids"][keep], ids_k[keep], scores_k[keep], c["pool_src"], c["pool_id"])
         cand.insert(1, "split", pd.Categorical(np.repeat(c["split"][keep], (ids_k[keep] >= 0).sum(axis=1))))
         train_cands.append(cand)
         print(f"  {country}: pairs_completeness={report['countries'][country]['pairs_completeness']:.4f}")
@@ -331,15 +343,17 @@ def main() -> int:
             print(f"  {country}: {len(s1_c)} S1 x {len(pool_c)} pool", flush=True)
             if len(pool_c) == 0:
                 ids_k = np.full((len(s1_c), chosen_k), -1, dtype=np.int32)
+                scores_k = np.full((len(s1_c), chosen_k), -np.inf, dtype=np.float32)
             else:
                 dense_ids = load_dense_ids(dense_dir, "test", country, len(s1_c)) if use_dense else None
                 res = block_country(s1_c, pool_c, dense_ids, (variant,), chosen_k)[variant]
                 ids_k = res["ids"]
+                scores_k = res["scores"]
                 test_reverse.append(reverse_agg_frame(pool_src, pool_id, res))
             del s1_c, pool_c
 
-            write_test_candidates(f, holder, long_tmp, s1_ids, ids_k, pool_src, pool_id)
-            del ids_k
+            write_test_candidates(f, holder, long_tmp, s1_ids, ids_k, scores_k, pool_src, pool_id)
+            del ids_k, scores_k
     if holder.get("w") is not None:
         holder["w"].close()
         long_tmp.replace(stage_dir / "test_candidates.parquet")

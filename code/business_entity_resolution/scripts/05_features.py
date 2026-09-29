@@ -36,14 +36,12 @@ from er.config import add_common_args, paths_from_args
 from er.features import PAIR_FEATURE_NAMES, build_idf_chunked, pair_feature_matrix
 from er.io import load_countries, load_pool, load_s1, load_s1_splits, mark_stage_done, pair_key, stage_is_done
 
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = 3  # bumped: graph features use the real blocking score; s1_name_share_count fixed
 REC_COLS = ["entity_id_num", "name_clean", "name_nospace", "legal_form", "name_transliterated",
             "address_clean", "postcode", "addr_numbers"]
 REC_FIELDS = REC_COLS[1:]
 GRAPH_COLS = ["fused_score", "fused_rank", "gap_to_s1_best", "reverse_rank", "gap_to_record_best", "is_s3"]
 FEATURE_COLS = ["s1_name_idf_sum", "s1_name_share_count", *PAIR_FEATURE_NAMES, *GRAPH_COLS]
-NAME_IDF = PAIR_FEATURE_NAMES.index("name_idf_cosine")
-ADDR_IDF = PAIR_FEATURE_NAMES.index("addr_idf_cosine")
 
 _IDF: dict[str, float] = {}  # set in the parent before forking the worker pool
 
@@ -118,6 +116,12 @@ def country_features(
     t0 = time.time()
     pool_c = load_pool(norm_dir, scope, ["entity_id_num", *REC_FIELDS], country, parse_numbers=False)
     s1_c = load_s1(norm_dir, scope, ["entity_id_num", *REC_FIELDS], country, parse_numbers=False)
+    # Name-frequency counts over every S1 in the country, taken before the
+    # train-scope filter below narrows s1_c to T/Vcal/Vtest -- otherwise train
+    # counts over ~400k S1s while test (never filtered) counts over the full
+    # ~1-1.3M-S1 country population, and s1_name_share_count ends up on two
+    # different scales (measured mean 3.1 train vs 10.2 test).
+    name_counts = s1_c["name_clean"].fillna("").value_counts()
     if scope == "train":
         s1_c = s1_c[s1_c["entity_id_num"].isin(cand["s1_id_num"].unique())].reset_index(drop=True)
 
@@ -128,7 +132,7 @@ def country_features(
         for s in range(0, len(pool_c), 500_000)
     )
     names = s1_c["name_clean"].fillna("")
-    share_count = names.map(names.value_counts()).to_numpy(np.float32)
+    share_count = names.map(name_counts).to_numpy(np.float32)
     idf_sum = np.array([sum(_IDF.get(t, 0.0) for t in nm.split()) for nm in names.tolist()], dtype=np.float32)
 
     s1_row = pd.Index(s1_c["entity_id_num"].to_numpy()).get_indexer(cand["s1_id_num"].to_numpy())
@@ -155,7 +159,11 @@ def country_features(
     t0 = time.time()
     for (lo, hi), pair_feats in zip(ranges, bounded_map(_worker, tasks(), workers)):
         sl = slice(lo, hi)
-        fused = 0.5 * (pair_feats[:, NAME_IDF] + pair_feats[:, ADDR_IDF])
+        # The real per-candidate RRF score from stage 04, on the same scale as
+        # rec_best/rec_second below (both RRF) -- not a name/address-cosine
+        # proxy recomputed here, which used to be compared against those
+        # RRF-scale aggregates as if it were on the same scale.
+        fused = cand["score"].to_numpy()[sl].astype(np.float32)
         src = cand["match_source"].to_numpy()[sl]
         graph = graph_features(s1_row[sl], fused.astype(np.float32), rec_best[pool_row[sl]], rec_second[pool_row[sl]], src)
         cols = {
@@ -223,7 +231,7 @@ def main() -> int:
     truth_keys = np.unique(triple_key(gt["s1_id_num"], gt["match_source"], gt["match_id_num"]))
     del gt
     split_of = load_s1_splits(load_dir).set_index("entity_id_num")["split"]
-    train_cand = pd.read_parquet(block_dir / "train_candidates.parquet", columns=["s1_id_num", "match_source", "match_id_num"])
+    train_cand = pd.read_parquet(block_dir / "train_candidates.parquet", columns=["s1_id_num", "match_source", "match_id_num", "score"])
     train_reverse = pd.read_parquet(block_dir / "train_reverse_agg.parquet")
     out_path = stage_dir / "train_features.parquet"
     tmp_path = out_path.with_suffix(".parquet.tmp")
@@ -250,7 +258,7 @@ def main() -> int:
     n_test = 0
     for country in load_countries(norm_dir, "s1", "test"):
         ids = load_s1(norm_dir, "test", ["entity_id_num"], country)["entity_id_num"]
-        cand = pq.read_table(test_path, columns=["s1_id_num", "match_source", "match_id_num"],
+        cand = pq.read_table(test_path, columns=["s1_id_num", "match_source", "match_id_num", "score"],
                              filters=[("s1_id_num", "in", ids.tolist())]).to_pandas()
         if len(cand):
             n_test += country_features("test", country, cand, norm_dir, test_reverse, None, None,

@@ -16,6 +16,16 @@ import anyascii as _anyascii
 
 NOISE_PREFIX_RE = re.compile(r"^\s*(--+|\*\*\*+|>>+|\[\.\.\]|#|@)\s*")
 DOMAIN_SUFFIX_RE = re.compile(r"(?<=\w)\.(com|in|fr|net|org|co)\b", re.IGNORECASE)
+# Commas/semicolons separate address/name parts but every downstream consumer
+# (blocking's word channel, feature Jaccard/cosine, legal-form splitting) only
+# ever does whitespace .split() -- so a trailing comma glues two tokens
+# together ("road," stays one token, never matching a clean "road"). Turning
+# them into spaces first, then dropping periods/brackets/slashes (postal
+# abbreviations like "no.", legal forms like "l.l.c." or "pvt.", parenthesized
+# words like "(india)"), was measured to affect 40% of address tokens and 12%
+# of name tokens.
+PUNCT_TO_SPACE_RE = re.compile(r"[,;]")
+PUNCT_TO_DROP_RE = re.compile(r"[.()\[\]/]")
 
 DEFAULT_LEGAL_FORMS = {
     "llc", "inc", "corp", "corporation", "co", "ltd", "limited",
@@ -88,8 +98,10 @@ def basic_normalize(s: str) -> str:
 
 def clean_noise(s: str) -> str:
     s = NOISE_PREFIX_RE.sub("", s)
-    s = DOMAIN_SUFFIX_RE.sub("", s)
-    return s.strip()
+    s = DOMAIN_SUFFIX_RE.sub("", s)  # must run before punctuation is dropped, on the "." it matches
+    s = PUNCT_TO_SPACE_RE.sub(" ", s)
+    s = PUNCT_TO_DROP_RE.sub("", s)
+    return " ".join(s.split())
 
 
 def apply_abbrev(tokens: list[str], country: str, abbrev_map: dict[tuple[str, str], str]) -> list[str]:
@@ -138,11 +150,18 @@ def normalize_name(
 
 
 def extract_postcode_and_numbers(address: str) -> tuple[Optional[str], list[str]]:
+    """A leading token is never taken as the postcode: addresses are either
+    "number street, city, state" or "state, city, street" (never observed
+    leading with a bare postcode), so a 5-6 digit first token is overwhelmingly
+    a house number, not a ZIP/PIN -- e.g. "10702 Alicante Way, Rancho
+    Cordova, CA" has no ZIP in the text at all, and without this check its
+    house number "10702" was wrongly captured as the postcode (and lost from
+    addr_numbers, where the number-conflict feature needs it)."""
     tokens = [t.strip(".,;:-") for t in re.split(r"[\s,]+", address.strip()) if t.strip(".,;:-")]
     postcode = None
     numbers = []
-    for tok in tokens:
-        if postcode is None and POSTCODE_TOKEN_RE.match(tok):
+    for i, tok in enumerate(tokens):
+        if postcode is None and i > 0 and POSTCODE_TOKEN_RE.match(tok):
             postcode = tok
             continue
         if ADDR_NUM_TOKEN_RE.match(tok):
