@@ -13,13 +13,15 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 MAX_LEN = 128
 
 
 def pair_text(rec: dict) -> str:
-    return f"{rec['name_clean']} | {rec['address_clean']}"
+    legal = rec.get("legal_form") or ""
+    name = f"{rec['name_clean']} {legal}".strip() if legal else rec["name_clean"]
+    return f"{name} | {rec['address_clean']}"
 
 
 class _PairDataset(Dataset):
@@ -58,6 +60,11 @@ def fine_tune(
     ds = _PairDataset(texts_a, texts_b, labels)
     batch_size = max(2, min(batch_size, len(ds)))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    # Linear warmup (6% of steps) then linear decay to 0, standard for
+    # transformer fine-tuning; the previous constant 2e-5 for the whole run
+    # is unstable early and doesn't anneal late.
+    num_steps = max(1, epochs * len(loader))
+    sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=max(1, round(0.06 * num_steps)), num_training_steps=num_steps)
 
     for _ in range(epochs):
         for a, b, y in loader:
@@ -68,6 +75,7 @@ def fine_tune(
             opt.zero_grad()
             out.loss.backward()
             opt.step()
+            sched.step()
 
     model.eval()
     return tokenizer, model

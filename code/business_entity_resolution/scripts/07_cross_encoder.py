@@ -4,10 +4,13 @@
 --mode fit   trains xlm-roberta-base on T (stage 04's candidates + ground
              truth only, so it can run in the GPU lane parallel to 05/06 --
              see Implementation_Plan.md's stage diagram) and saves it.
---mode score reads stage 06's calibrated probabilities, re-scores the pairs
-             it leaves uncertain with the fine-tuned model, re-calibrates
-             just that scored subset against Vcal, and finishes the tier
-             (tau tuning, decide, submission, report) exactly like stage 06.
+--mode score reads stage 06's calibrated probabilities, re-scores the
+             top-10-by-rank pairs it hasn't ruled out with the fine-tuned
+             model, fits a context stacker on Vcal (the prior probability,
+             whether a pair was re-scored, its cross-encoder score, and how
+             it ranks among its S1's other candidates) and finishes the
+             tier (tau tuning, decide, submission, report) exactly like
+             stage 06.
 --mode all   runs fit then score (the default, for standalone use).
 
 Writes work/07_cross_encoder/model/, matching_results.tsv, report.json, and
@@ -32,14 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from er.config import add_common_args, paths_from_args
 from er.cross_encoder import fine_tune, pair_text, score_pairs
-from er.decide import apply_calibration, calibrate_scores, finish_tier
+from er.decide import apply_context_stacker, fit_context_stacker, finish_tier
 from er.io import load_s1_splits, mark_stage_done, release_memory, stage_is_done
-from er.pairs import RecordTexts, closest_to_half, label_pairs, rank_in_s1, set_prob, triple_key
+from er.pairs import RecordTexts, closest_to_half, label_pairs, rank_in_s1, triple_key
 from er.metrics import build_truth_dict
 from er.submit import validate, write_matching_results
 
 DEFAULT_MODEL = "xlm-roberta-base"
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = 3  # bumped: wider uncertain-band + context stacker + hard-negative sampling
 
 
 def build_training_pairs(norm_dir: Path, load_dir: Path, block_dir: Path, max_pairs: int, seed: int):
@@ -47,10 +50,14 @@ def build_training_pairs(norm_dir: Path, load_dir: Path, block_dir: Path, max_pa
     t_ids = splits.loc[splits["split"] == "T", "entity_id_num"]
     gt = pd.read_parquet(load_dir / "gt_pairs.parquet")
     pos = gt[gt["s1_id_num"].isin(t_ids)].drop_duplicates()
-    cand = pd.read_parquet(block_dir / "train_candidates.parquet", columns=["s1_id_num", "split", "match_source", "match_id_num"])
+    cand = pd.read_parquet(block_dir / "train_candidates.parquet", columns=["s1_id_num", "split", "match_source", "match_id_num", "rank"])
     cand = cand[cand["split"] == "T"].drop(columns=["split"])
     pos_keys = np.unique(triple_key(pos["s1_id_num"], pos["match_source"], pos["match_id_num"]))
-    neg = cand[~np.isin(triple_key(cand["s1_id_num"], cand["match_source"], cand["match_id_num"]), pos_keys)]
+    is_neg = ~np.isin(triple_key(cand["s1_id_num"], cand["match_source"], cand["match_id_num"]), pos_keys)
+    # Hard negatives: candidates the cross-encoder will actually be asked to
+    # discriminate at inference (07's uncertain band is rank<=10), not a
+    # uniform sample of all 50 blocking candidates, most of which are easy.
+    neg = cand[is_neg & (cand["rank"] <= 10)].drop(columns=["rank"])
     del cand
 
     texts = RecordTexts(norm_dir, "train")
@@ -80,10 +87,22 @@ def build_training_pairs(norm_dir: Path, load_dir: Path, block_dir: Path, max_pa
 
 
 def select_uncertain(df: pd.DataFrame, max_pairs: int) -> pd.DataFrame:
+    """Top-10-by-rank candidates the GBDT hasn't already ruled out (p<=0.97).
+    No lower bound: many true pairs get buried by the GBDT below p=0.03 at
+    rank 2-10 (measured on Vtest) and are worth the cross-encoder's look."""
     rank = rank_in_s1(df)
-    prob = df["prob"]
-    band = ((rank <= 10) & prob.between(0.03, 0.97)) | ((rank == 1) & prob.between(0.1, 0.9))
-    return closest_to_half(df[band.to_numpy()], max_pairs)
+    band = (rank <= 10) & (df["prob"].to_numpy() <= 0.97)
+    return closest_to_half(df[band], max_pairs)
+
+
+def scored_arrays(df: pd.DataFrame, sel: pd.DataFrame, new_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(scored bool, new_prob float32) aligned to all of `df`'s rows, NaN/False
+    where `sel` (a `select_uncertain` subset, same index as `df`) has no score."""
+    scored = np.zeros(len(df), dtype=bool)
+    new_prob = np.full(len(df), np.nan, dtype=np.float32)
+    scored[sel.index] = True
+    new_prob[sel.index] = new_scores
+    return scored, new_prob
 
 
 def score_subset(sel: pd.DataFrame, texts: RecordTexts, tokenizer, model, device, block: int) -> np.ndarray:
@@ -94,6 +113,8 @@ def score_subset(sel: pd.DataFrame, texts: RecordTexts, tokenizer, model, device
         out[start:start + len(part)] = score_pairs(
             tokenizer, model, [pair_text(r) if r else "" for r in recs_a], [pair_text(r) if r else "" for r in recs_b], device,
         )
+        del part, recs_a, recs_b
+        release_memory()  # the widened uncertain band can put ~60 blocks through this loop
     return out
 
 
@@ -102,7 +123,10 @@ def main() -> int:
     p.add_argument("--mode", choices=["fit", "score", "all"], default="all")
     p.add_argument("--ce-model", default=DEFAULT_MODEL)
     p.add_argument("--max-train-pairs", type=int, default=1_500_000)
-    p.add_argument("--ce-max-pairs", type=int, default=6_000_000)
+    # The wider top-10/p<=0.97 band needs ~7.3 pairs/S1 (measured on Vcal/Vtest);
+    # at test scale (1.73M S1) that's ~13M pairs, so the cap is raised to cover
+    # it without silently truncating to the pairs closest to 0.5.
+    p.add_argument("--ce-max-pairs", type=int, default=15_000_000)
     p.add_argument("--score-block", type=int, default=200_000, help="pairs whose texts are gathered and scored at a time")
     args, _ = p.parse_known_args()
     paths = paths_from_args(args)
@@ -176,12 +200,14 @@ def main() -> int:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    print("stacking [prior prob, cross-encoder score] on the Vcal subset...")
-    stack_feat = np.column_stack([vcal_sel["prob"].to_numpy(), vcal_ce])
-    lr = calibrate_scores(stack_feat, vcal_sel["label"].to_numpy())
-    set_prob(vcal_df, vcal_sel, apply_calibration(lr, stack_feat))
-    set_prob(vtest_df, vtest_sel, apply_calibration(lr, np.column_stack([vtest_sel["prob"].to_numpy(), vtest_ce])))
-    set_prob(test_df, test_sel, apply_calibration(lr, np.column_stack([test_sel["prob"].to_numpy(), test_ce])))
+    print("fitting the context stacker on Vcal...")
+    vcal_scored, vcal_new = scored_arrays(vcal_df, vcal_sel, vcal_ce)
+    vtest_scored, vtest_new = scored_arrays(vtest_df, vtest_sel, vtest_ce)
+    test_scored, test_new = scored_arrays(test_df, test_sel, test_ce)
+    stacker = fit_context_stacker(vcal_df, vcal_scored, vcal_new)
+    vcal_df["prob"] = apply_context_stacker(stacker, vcal_df, vcal_scored, vcal_new)
+    vtest_df["prob"] = apply_context_stacker(stacker, vtest_df, vtest_scored, vtest_new)
+    test_df["prob"] = apply_context_stacker(stacker, test_df, test_scored, test_new)
 
     s1_train = pd.read_parquet(load_dir / "s1_train.parquet", columns=["entity_id_num", "country", "split"])
     s1_train = s1_train[s1_train["split"].isin(["Vcal", "Vtest"])]

@@ -3,7 +3,8 @@
 The same `decide()` is used for every tier (v1 GBDT-only, v2 +cross-encoder,
 v3 +LLM judge) -- only which probability column feeds it changes. Steps:
 1. calibrate raw model scores to P(match) with a 1-D logistic regression
-   fit on Vcal (Platt scaling);
+   fit on Vcal (Platt scaling), or -- for tiers 07/08, which only re-score
+   part of an S1's candidates -- the context stacker below;
 2. each S2/S3 record keeps only its highest-probability S1 (a measured data
    fact: every S2/S3 record matches at most one S1);
 3. per S1 entity, sort candidates by probability and pick the prefix size m
@@ -20,8 +21,10 @@ from __future__ import annotations
 import numba
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 
+from .config import SEED
 from .io import pair_key
 from .metrics import macro_f05, macro_f05_by_country
 
@@ -48,6 +51,96 @@ def apply_calibration(lr: LogisticRegression, raw_scores: np.ndarray) -> np.ndar
     """P(match) as float32 (the test side has ~80M rows; float64 would add
     ~0.3GB per copy for no decision-relevant precision)."""
     return lr.predict_proba(_as_2d(raw_scores))[:, 1].astype(np.float32)
+
+
+def context_features(df: pd.DataFrame, scored: np.ndarray, new_prob: np.ndarray, prior_col: str = "prob") -> pd.DataFrame:
+    """Feature matrix for the context stacker used by tiers 07/08 (replaces
+    the plain 2-feature Platt-scaling calibration those tiers used to apply
+    to just the pairs they re-scored): the prior tier's probability,
+    whether this tier re-scored the pair, this tier's own probability-like
+    score (`new_prob`, NaN where not re-scored -- HistGradientBoosting
+    splits on NaN as its own branch, so this needs no imputation), and how
+    a "combined" score (`new_prob` where re-scored, else the prior
+    probability -- both already 0-1 scaled) ranks within the pair's S1: the
+    S1's max and sum, the gap to its max, how many candidates clear 0.5,
+    and this pair's rank.
+
+    Built entirely from columns every tier already has in memory (no merge
+    against blocking's candidate file): an ablation on saved Vcal/Vtest
+    scores found the blocking rank and the GBDT's raw (pre-calibration)
+    score added no measurable gain once these features are present.
+
+    Group aggregates use a lexsort + reduceat, not pandas groupby: on the
+    test side (up to ~86M rows) a `groupby(s1).transform(...)` OOM-killed a
+    full run (>10GB RSS) -- the exact pandas-groupby-at-this-scale cost this
+    module's own decide()/enforce_record_uniqueness() already avoid above.
+    """
+    prior = df[prior_col].to_numpy()
+    comb = np.where(scored, new_prob, prior).astype(np.float32)
+    s1 = df["s1_id_num"].to_numpy()
+    n = len(s1)
+    order = np.lexsort((-comb, s1))
+    s1_sorted = s1[order]
+    starts = np.concatenate([[0], np.flatnonzero(s1_sorted[1:] != s1_sorted[:-1]) + 1])
+    group = np.empty(n, dtype=np.int64)
+    group[order] = np.repeat(np.arange(len(starts)), np.diff(np.append(starts, n)))
+    comb_sorted = comb[order]
+    group_max = np.maximum.reduceat(comb_sorted, starts)
+    group_sum = np.add.reduceat(comb_sorted.astype(np.float64), starts)
+    group_n_half = np.add.reduceat(comb_sorted > 0.5, starts)
+    comb_max = group_max[group]
+    rank = np.empty(n, dtype=np.float32)
+    rank[order] = np.arange(n) - starts[group[order]] + 1
+    return pd.DataFrame({
+        "prior": prior.astype(np.float32),
+        "scored": scored.astype(np.float32),
+        "new_prob": np.where(scored, new_prob, np.nan).astype(np.float32),
+        "comb_max": comb_max.astype(np.float32),
+        "comb_sum": group_sum[group].astype(np.float32),
+        "comb_gap": (comb_max - comb).astype(np.float32),
+        "comb_n_half": group_n_half[group].astype(np.float32),
+        "comb_rank": rank,
+    })
+
+
+def fit_context_stacker(vcal_df: pd.DataFrame, scored: np.ndarray, new_prob: np.ndarray) -> HistGradientBoostingClassifier:
+    """Fit the context stacker on Vcal. `vcal_df` needs 's1_id_num', 'prob'
+    (the prior tier's probability) and 'label'."""
+    X = context_features(vcal_df, scored, new_prob)
+    model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31, random_state=SEED)
+    model.fit(X, vcal_df["label"].to_numpy())
+    return model
+
+
+def apply_context_stacker(
+    model: HistGradientBoostingClassifier, df: pd.DataFrame, scored: np.ndarray, new_prob: np.ndarray,
+    chunk_size: int = 5_000_000,
+) -> np.ndarray:
+    """Predict in S1-aligned row chunks of about `chunk_size`, so peak memory
+    stays bounded regardless of `df`'s size: at test scale (~86M rows)
+    building `context_features` for the whole frame plus predict_proba's own
+    output was measured at >10GB RSS (over the per-stage cap, OOM-killed).
+    `df` must already be grouped by s1_id_num (every other tier/stage script
+    that builds these frames already keeps candidates grouped by S1 -- see
+    05_features.py's chunk_ranges)."""
+    n = len(df)
+    if n <= chunk_size:
+        X = context_features(df, scored, new_prob)
+        return model.predict_proba(X)[:, 1].astype(np.float32)
+
+    s1 = df["s1_id_num"].to_numpy()
+    out = np.empty(n, dtype=np.float32)
+    lo = 0
+    while lo < n:
+        hi = min(lo + chunk_size, n)
+        while hi < n and s1[hi] == s1[hi - 1]:  # never split one S1 across chunks
+            hi += 1
+        sl = slice(lo, hi)
+        X = context_features(df.iloc[sl], scored[sl], new_prob[sl])
+        out[sl] = model.predict_proba(X)[:, 1].astype(np.float32)
+        del X
+        lo = hi
+    return out
 
 
 def enforce_record_uniqueness(df: pd.DataFrame, prob_col: str = "prob") -> pd.DataFrame:

@@ -3,9 +3,9 @@
 
 Reads stage 07's (v2) combined probability, sends the pairs it leaves
 uncertain to Qwen3-4B-Instruct-2507 (logit(Yes) - logit(No) from a single
-forward pass, no generation, with 4 fixed few-shot examples from T),
-re-calibrates just that scored subset against Vcal, and finishes the tier
-like stages 06/07.
+forward pass, no generation, with 4 fixed few-shot examples from T), fits a
+context stacker on Vcal like stage 07's, and finishes the tier like stages
+06/07.
 
 `--llm-finetune lora` is accepted but a no-op (off by default: bitsandbytes/
 peft support on Blackwell is a risk, per Implementation_Plan.md).
@@ -32,9 +32,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from er.config import add_common_args, paths_from_args
-from er.decide import apply_calibration, calibrate_scores, finish_tier
+from er.decide import apply_context_stacker, fit_context_stacker, finish_tier
 from er.io import load_s1_splits, mark_stage_done, release_memory, stage_is_done
-from er.pairs import RecordTexts, closest_to_half, label_pairs, rank_in_s1, set_prob, triple_key
+from er.pairs import RecordTexts, closest_to_half, label_pairs, rank_in_s1, triple_key
 from er.llm import LLMHelper, resolve_model_name
 from er.metrics import build_truth_dict
 from er.submit import validate, write_matching_results
@@ -66,10 +66,26 @@ def build_examples(norm_dir: Path, load_dir: Path, block_dir: Path) -> list[dict
 
 
 def select_for_judge(df: pd.DataFrame, max_pairs: int) -> pd.DataFrame:
+    """Deliberately left narrower than 07's uncertain band: the LLM judges
+    ~6.5 pairs/s on an 8GB GPU (compute-bound, NF4), so widening it the way
+    07's band was widened would multiply an already marginal stage's cost
+    by ~7x for pairs the cross-encoder has already looked at once."""
     rank = rank_in_s1(df)
     prob = df["prob"]
     band = prob.between(0.15, 0.85) | ((rank == 1) & prob.between(0.35, 0.65))
     return closest_to_half(df[band.to_numpy()], max_pairs)
+
+
+def scored_arrays(df: pd.DataFrame, sel: pd.DataFrame, new_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(scored bool, new_prob float32) aligned to all of `df`'s rows. The LLM's
+    raw score is logit(Yes) - logit(No) (unbounded), not a probability, so it
+    is squashed through a sigmoid first -- the context stacker's S1-group
+    aggregates need every row's score on the same 0-1 scale, scored or not."""
+    scored = np.zeros(len(df), dtype=bool)
+    new_prob = np.full(len(df), np.nan, dtype=np.float32)
+    scored[sel.index] = True
+    new_prob[sel.index] = 1.0 / (1.0 + np.exp(-new_scores))
+    return scored, new_prob
 
 
 def score_subset(sel: pd.DataFrame, texts: RecordTexts, llm: LLMHelper, examples: list[dict], block: int = 100_000) -> np.ndarray:
@@ -81,6 +97,8 @@ def score_subset(sel: pd.DataFrame, texts: RecordTexts, llm: LLMHelper, examples
                   "name_b": (b or {}).get("name_clean", ""), "addr_b": (b or {}).get("address_clean", "")}
                  for a, b in zip(recs_a, recs_b)]
         out[start:start + len(part)] = llm.judge_pairs(pairs, examples)
+        del part, recs_a, recs_b, pairs
+        release_memory()
     return out
 
 
@@ -108,7 +126,7 @@ def main() -> int:
     if args.llm_finetune == "lora":
         print("WARN: --llm-finetune lora is a no-op (off by default: bitsandbytes/peft on Blackwell is a risk)")
 
-    config = {"data_dir": str(paths.data_dir), "seed": args.seed, "llm_model": args.llm_model, "llm_max_pairs": args.llm_max_pairs, "output_version": 2}
+    config = {"data_dir": str(paths.data_dir), "seed": args.seed, "llm_model": args.llm_model, "llm_max_pairs": args.llm_max_pairs, "output_version": 3}
     if stage_is_done(stage_dir, config):
         print("08_llm_judge: already done, skipping")
         return 0
@@ -150,12 +168,14 @@ def main() -> int:
     test_llm = score_subset(test_sel, texts, llm, examples)
     del texts, llm
 
-    print("stacking [prior prob, LLM logit-diff] on the Vcal subset...")
-    stack_feat = np.column_stack([vcal_sel["prob"].to_numpy(), vcal_llm])
-    lr = calibrate_scores(stack_feat, vcal_sel["label"].to_numpy())
-    set_prob(vcal_df, vcal_sel, apply_calibration(lr, stack_feat))
-    set_prob(vtest_df, vtest_sel, apply_calibration(lr, np.column_stack([vtest_sel["prob"].to_numpy(), vtest_llm])))
-    set_prob(test_df, test_sel, apply_calibration(lr, np.column_stack([test_sel["prob"].to_numpy(), test_llm])))
+    print("fitting the context stacker on Vcal...")
+    vcal_scored, vcal_new = scored_arrays(vcal_df, vcal_sel, vcal_llm)
+    vtest_scored, vtest_new = scored_arrays(vtest_df, vtest_sel, vtest_llm)
+    test_scored, test_new = scored_arrays(test_df, test_sel, test_llm)
+    stacker = fit_context_stacker(vcal_df, vcal_scored, vcal_new)
+    vcal_df["prob"] = apply_context_stacker(stacker, vcal_df, vcal_scored, vcal_new)
+    vtest_df["prob"] = apply_context_stacker(stacker, vtest_df, vtest_scored, vtest_new)
+    test_df["prob"] = apply_context_stacker(stacker, test_df, test_scored, test_new)
 
     s1_train = pd.read_parquet(load_dir / "s1_train.parquet", columns=["entity_id_num", "country", "split"])
     s1_train = s1_train[s1_train["split"].isin(["Vcal", "Vtest"])]

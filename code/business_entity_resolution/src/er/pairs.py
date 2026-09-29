@@ -15,7 +15,7 @@ import pandas as pd
 
 from .io import load_pool, load_s1, pair_key
 
-TEXT_COLS = ["entity_id_num", "name_clean", "address_clean"]
+TEXT_COLS = ["entity_id_num", "name_clean", "address_clean", "legal_form"]
 
 
 def triple_key(s1, source, mid) -> np.ndarray:
@@ -62,20 +62,22 @@ def set_prob(df: pd.DataFrame, sel: pd.DataFrame, refined: np.ndarray) -> None:
 class RecordTexts:
     """name_clean/address_clean for one scope's S1 and pool records."""
 
+    _FIELDS = ["name_clean", "address_clean", "legal_form"]
+
     def __init__(self, norm_dir: Path, scope: str):
         s1 = load_s1(norm_dir, scope, TEXT_COLS, parse_numbers=False)
         self._s1_index = pd.Index(s1["entity_id_num"].to_numpy())
-        self._s1 = s1[["name_clean", "address_clean"]].fillna("")
+        self._s1 = s1[self._FIELDS].fillna("")
         pool = load_pool(norm_dir, scope, TEXT_COLS, parse_numbers=False)
         self._pool_index = pd.Index(pair_key(pool["source"], pool["entity_id_num"]))
-        self._pool = pool[["name_clean", "address_clean"]].fillna("")
+        self._pool = pool[self._FIELDS].fillna("")
 
-    @staticmethod
-    def _records(table: pd.DataFrame, rows: np.ndarray) -> list[dict | None]:
+    @classmethod
+    def _records(cls, table: pd.DataFrame, rows: np.ndarray) -> list[dict | None]:
         ok = rows >= 0
         sub = table.iloc[rows[ok]]
-        found = iter([{"name_clean": n, "address_clean": a}
-                      for n, a in zip(sub["name_clean"].tolist(), sub["address_clean"].tolist())])
+        cols = {c: sub[c].tolist() for c in cls._FIELDS}
+        found = iter([dict(zip(cols, vals)) for vals in zip(*cols.values())])
         return [next(found) if o else None for o in ok.tolist()]
 
     def s1_records(self, s1_ids) -> list[dict | None]:
